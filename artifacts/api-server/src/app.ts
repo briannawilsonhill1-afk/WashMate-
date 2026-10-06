@@ -2,6 +2,7 @@ import express, { type Express, type Request, type Response, type NextFunction }
 import cors from "cors";
 import pinoHttp from "pino-http";
 import { logger } from "./lib/logger";
+import { deploymentDomains } from "./lib/domains";
 import {
   CLERK_PROXY_PATH,
   clerkProxyMiddleware,
@@ -22,26 +23,17 @@ import { mountStripeWebhook } from "./routes/stripeWebhook";
  * session in a visitor's browser via a cross-origin credentialed fetch.
  */
 function buildAllowedOrigins(): Set<string> {
-  const allowed = new Set<string>();
+  const domains = deploymentDomains();
 
-  const replitDomains = process.env["REPLIT_DOMAINS"] ?? "";
-
-  if (!replitDomains.trim() && process.env["NODE_ENV"] === "production") {
+  if (domains.length === 0 && process.env["NODE_ENV"] === "production") {
     logger.warn(
-      "REPLIT_DOMAINS is not set in production — no origins will be " +
-        "allowed for credentialed CORS. Set REPLIT_DOMAINS to the " +
-        "comma-separated list of production hostnames.",
+      "No deployment domains are configured in production — no origins " +
+        "will be allowed for credentialed CORS. Set ALLOWED_DOMAINS (or " +
+        "REPLIT_DOMAINS) to the comma-separated list of production hostnames.",
     );
   }
 
-  for (const domain of replitDomains.split(",")) {
-    const trimmed = domain.trim();
-    if (trimmed) {
-      allowed.add(`https://${trimmed}`);
-    }
-  }
-
-  return allowed;
+  return new Set(domains.map((domain) => `https://${domain}`));
 }
 
 const allowedOrigins = buildAllowedOrigins();

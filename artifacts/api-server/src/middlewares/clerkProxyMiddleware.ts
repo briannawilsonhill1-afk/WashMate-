@@ -23,6 +23,7 @@ import { createProxyMiddleware } from "http-proxy-middleware";
 import type { RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "http";
 import { logger } from "../lib/logger";
+import { deploymentDomains } from "../lib/domains";
 
 const CLERK_FAPI = "https://frontend-api.clerk.dev";
 export const CLERK_PROXY_PATH = "/api/__clerk";
@@ -54,7 +55,7 @@ export function normalizeHost(host: string | undefined): string | undefined {
 }
 
 export function buildAllowedHosts(
-  replitDomains = process.env["REPLIT_DOMAINS"] ?? "",
+  replitDomains = deploymentDomains().join(","),
 ): Set<string> {
   const allowed = new Set<string>();
   for (const domain of replitDomains.split(",")) {

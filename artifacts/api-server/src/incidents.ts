@@ -1,6 +1,6 @@
 import express, { type Express, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
-import { Client } from "@replit/object-storage";
+import { deploymentDomains } from "./lib/domains";
 import { z } from "zod";
 import { pool } from "./db";
 import { isAuthenticated, getUserId } from "./auth";
@@ -50,10 +50,13 @@ async function authorized(c: Pick<PoolClient, "query">, incidentId: number, uid:
 function admin(req: Request) {
   if (!isIncidentAdmin(getUserId(req))) fail(403, "Administrator access required");
 }
-function storageClient() {
+async function storageClient() {
   // Explicit bucket avoids accidentally using an unrelated default bucket.
   const bucketId = process.env.INCIDENT_EVIDENCE_BUCKET_ID;
   if (!bucketId) fail(503, "Private evidence storage is not provisioned. Configure INCIDENT_EVIDENCE_BUCKET_ID.");
+  // Loaded lazily so the API still boots in environments (e.g. the Vercel
+  // function bundle) where the Replit storage SDK is not available.
+  const { Client } = await import("@replit/object-storage");
   return new Client({bucketId});
 }
 const evidenceView = (r: any) => ({
@@ -100,7 +103,7 @@ export function registerIncidentRoutes(app: Express) {
     const uid = getUserId(req);
     const eligible = await pool.query("SELECT 1 FROM incidents WHERE customer_id=$1 LIMIT 1", [uid]);
     if (!eligible.rowCount) fail(403, "A customer incident is required for reimbursement onboarding");
-    const host = (process.env.REPLIT_DOMAINS ?? "").split(",")[0]?.trim();
+    const host = deploymentDomains()[0];
     if (!host || !/^[a-zA-Z0-9.-]+$/.test(host)) fail(503, "Reimbursement return domain is not configured");
     const stripe = await getUncachableStripeClient();
     await pool.query("INSERT INTO reimbursement_accounts(user_id) VALUES($1) ON CONFLICT DO NOTHING", [uid]);
@@ -162,7 +165,7 @@ export function registerIncidentRoutes(app: Express) {
     route(async (req, res) => {
       const type = req.headers["content-type"]?.split(";")[0] ?? "";
       if (!Buffer.isBuffer(req.body) || !validEvidence(req.body, type)) fail(400, "A valid JPEG, PNG or PDF up to 5MB is required");
-      const client = storageClient();
+      const client = await storageClient();
       const result = await transaction(async c => {
         const row = await authorized(c, id(req), getUserId(req), true);
         if (row.status !== "submitted") fail(409, "Reviewed incidents cannot be edited");
@@ -181,7 +184,7 @@ export function registerIncidentRoutes(app: Express) {
     const evidenceId = z.string().uuid().parse(req.params.evidenceId);
     const e = (await pool.query("SELECT * FROM incident_evidence WHERE id=$1 AND incident_id=$2", [evidenceId,row.id])).rows[0];
     if (!e) fail(404, "Evidence not found");
-    const result = await storageClient().downloadAsBytes(e.object_key);
+    const result = await (await storageClient()).downloadAsBytes(e.object_key);
     if (!result.ok) fail(503, "Private evidence storage unavailable");
     res.set({"Content-Type": e.content_type, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Content-Disposition": `attachment; filename="evidence-${e.id}"`});
     res.send(Buffer.from(result.value[0]));

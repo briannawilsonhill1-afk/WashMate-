@@ -5,6 +5,14 @@ let connectionSettings:
   | undefined;
 
 async function getCredentials(): Promise<{ publishableKey: string; secretKey: string }> {
+  // Outside Replit (e.g. on Vercel) there is no connector proxy, so read the
+  // keys from standard environment variables when both are present.
+  const envSecretKey = process.env["STRIPE_SECRET_KEY"];
+  const envPublishableKey = process.env["STRIPE_PUBLISHABLE_KEY"];
+  if (envSecretKey && envPublishableKey) {
+    return { publishableKey: envPublishableKey, secretKey: envSecretKey };
+  }
+
   const hostname = process.env["REPLIT_CONNECTORS_HOSTNAME"];
   const xReplitToken = process.env["REPL_IDENTITY"]
     ? "repl " + process.env["REPL_IDENTITY"]
