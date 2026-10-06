@@ -1,0 +1,4 @@
+- [Storage bundling](storage-bundling.md) — preserve the storage SDK’s pnpm dependency scope when bundling the API.
+- [DOM test runtime](dom-test-runtime.md) — check Node compatibility before upgrading the browser test environment.
+- [Artifact manifest replacement](artifact-manifest-replacement.md) — protected artifact.toml files require verified replacement from a sibling temporary file.
+- [Static artifact caching](static-artifact-caching.md) — verify published asset headers; root deployment rules may not reach a web artifact's static handler.

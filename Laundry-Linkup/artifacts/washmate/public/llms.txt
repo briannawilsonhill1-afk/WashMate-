@@ -1,0 +1,8 @@
+# WashMate
+
+WashMate connects customers with vetted local laundry washers for pickup, washing, folding, and delivery.
+
+## Public pages
+
+- [WashMate home](https://washloop.net/)
+- [Privacy policy](https://washloop.net/privacy)

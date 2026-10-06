@@ -1,0 +1,95 @@
+kind = "web"
+previewPath = "/"
+title = "WashMate"
+version = "1.0.0"
+id = "artifacts/washmate"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24238
+
+[services.development]
+run = "pnpm --filter @workspace/washmate run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/washmate", "run", "build" ]
+publicDir = "artifacts/washmate/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/privacy"
+to = "/privacy/index.html"
+
+[[services.production.rewrites]]
+from = "/privacy/"
+to = "/privacy/index.html"
+
+[[services.production.rewrites]]
+from = "/sign-in"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/sign-in/*"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/sign-up"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/sign-up/*"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/welcome"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/customer"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/washer"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/washer/profile"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/orders/*"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/settings"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/incidents"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/incidents/*"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/admin/incidents"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/admin/incidents/*"
+to = "/index.html"
+
+[[services.production.rewrites]]
+from = "/admin/revenue"
+to = "/index.html"
+
+[services.env]
+PORT = "24238"
+BASE_PATH = "/"

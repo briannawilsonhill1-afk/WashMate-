@@ -1,0 +1,19 @@
+{
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_WASHMATE_URL": "https://washloop.net"
+      }
+    },
+    "production": {
+      "env": {
+        "EXPO_PUBLIC_WASHMATE_URL": "https://washloop.net"
+      }
+    }
+  }
+}

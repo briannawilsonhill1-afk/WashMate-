@@ -1,0 +1,35 @@
+uploads = []
+
+[[generated]]
+id = "lbW203aeK5e2L6nrZQlCd"
+uri = "file://artifacts/washmate-ios/assets/images/icon.png"
+type = "image"
+title = "washmate app icon"
+
+[[outputs]]
+id = "EzN1_U5F9ijXvrNtLKS3F"
+uri = "file://launch_readiness.md"
+type = "text"
+title = "WashMate Launch-Readiness Review"
+description = "Read-only launch assessment with a no-go decision, prioritized evidence, task mapping, launch gates, and post-launch improvements."
+logical_id = "2b89d177-3481-4d18-9374-01f79f8d5f16"
+content_hash = "sha256:28984a742aad9dbb442f1454d80e67bf3016715e360731648745897427b5a452"
+size = 19562
+mtime_ms = 1790156123693
+storage_uri = "gcs://replit-rams-assets-worf/rams/assets/repl:cc6d3640-fcff-4f1a-89e0-2fcacf3c55c5/2b89d177-3481-4d18-9374-01f79f8d5f16/fb905a00-c9c7-4d1c-8087-67a78c990d5e"
+storage_version_token = "1790156159065236"
+content_type = "text/markdown"
+
+[[outputs]]
+id = "XaG3ZxjgTfonSVGiT0e6c"
+uri = "file://.local/outputs/washmate-weekly-pageviews.chart.html"
+type = "text"
+title = "Pageviews peaked at 32 on Sep 23"
+description = "Daily pageviews recorded during September 22–28, 2026. Dates without recorded pageviews are omitted."
+logical_id = "6ccae650-f597-4cf5-bd73-b86a0553ba69"
+content_hash = "sha256:a4d5dcfad88215803c706457fb88c1be0bb8fe71477c7e4b08a6d03eaad517f5"
+size = 3805
+mtime_ms = 1790648603342
+storage_uri = "gcs://replit-rams-assets-worf/rams/assets/repl:cc6d3640-fcff-4f1a-89e0-2fcacf3c55c5/6ccae650-f597-4cf5-bd73-b86a0553ba69/d4950799-4611-475b-8f5d-fbc2fa326a26"
+storage_version_token = "1790648604302463"
+content_type = "text/html;profile=replit-chart"

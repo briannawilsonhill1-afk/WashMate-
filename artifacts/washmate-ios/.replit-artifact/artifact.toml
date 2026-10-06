@@ -1,0 +1,30 @@
+kind = "mobile"
+previewPath = "/washmate-ios/"
+title = "WashMate iOS"
+version = "1.0.0"
+id = "artifacts/washmate-ios"
+router = "expo-domain"
+
+[[integratedSkills]]
+name = "expo"
+version = "1.0.0"
+
+[[services]]
+ensurePreviewReachable = "/status"
+name = "expo"
+paths = [ "/washmate-ios/" ]
+localPort = 25172
+
+[services.development]
+run = "pnpm --filter @workspace/washmate-ios run dev"
+
+# No [services.production] block: the WashMate iOS app is a native WebView
+# shell distributed via TestFlight / the App Store and points at the published
+# WashMate web URL. It must NOT be bundled into the Autoscale (Cloud Run) web
+# deployment — including a production block here makes the deployment try to
+# build and serve the Expo bundle as a second HTTP service, which Cloud Run
+# (single-port) cannot run alongside the API server and the static web app.
+
+[services.env]
+PORT = "25172"
+BASE_PATH = "/washmate-ios/"

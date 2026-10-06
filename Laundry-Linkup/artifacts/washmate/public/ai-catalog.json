@@ -1,0 +1,15 @@
+{
+  "name": "WashMate",
+  "description": "Local laundry pickup, washing, folding, and delivery.",
+  "url": "https://washloop.net/",
+  "resources": [
+    {
+      "name": "WashMate home",
+      "url": "https://washloop.net/"
+    },
+    {
+      "name": "Privacy policy",
+      "url": "https://washloop.net/privacy"
+    }
+  ]
+}
