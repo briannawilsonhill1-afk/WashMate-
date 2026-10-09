@@ -22,6 +22,7 @@ import {
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Analytics } from "@vercel/analytics/react";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 
 import { useAuth } from "@/hooks/use-auth";
 import { usePushRegistration } from "@/hooks/use-push-registration";
@@ -434,6 +435,7 @@ function App() {
     <WouterRouter base={basePath}>
       <ClerkProviderWithRoutes />
       <Analytics />
+      <SpeedInsights />
     </WouterRouter>
   );
 }
