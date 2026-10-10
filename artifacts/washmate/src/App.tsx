@@ -6,6 +6,7 @@ import {
   Show,
   useClerk,
 } from "@clerk/react";
+import { Analytics } from "@vercel/analytics/react";
 import { shadcn } from "@clerk/themes";
 import {
   Switch,
