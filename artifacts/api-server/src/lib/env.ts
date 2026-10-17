@@ -58,21 +58,20 @@ export function assertRequiredEnv(env: NodeJS.ProcessEnv = process.env): void {
   // Checkr screens every washer before they can claim jobs. Without the API
   // key no invitations can be created; without the webhook secret, report
   // deliveries cannot be verified; without the package slug, invitations
-  // cannot be ordered. Hard-require all three in production; warn elsewhere.
+  // cannot be ordered. Missing config never blocks startup: the API boots
+  // and washer screenings stay pending (endpoints answer 503 "Screening
+  // provider is not configured") until Checkr is configured, so the rest
+  // of the API keeps working while the Checkr account is being set up.
+  // Add CHECKR_API_KEY, CHECKR_WEBHOOK_SECRET and CHECKR_PACKAGE to enable
+  // live screenings.
   const checkrMissing: string[] = [];
   if (!env["CHECKR_API_KEY"]) checkrMissing.push("CHECKR_API_KEY");
   if (!env["CHECKR_WEBHOOK_SECRET"]) checkrMissing.push("CHECKR_WEBHOOK_SECRET");
   if (!env["CHECKR_PACKAGE"]) checkrMissing.push("CHECKR_PACKAGE");
   if (checkrMissing.length > 0) {
-    if (env["NODE_ENV"] === "production") {
-      throw new Error(
-        `Missing required environment variables: ${checkrMissing.join(", ")}. ` +
-          `Washer background screening cannot function without these.`,
-      );
-    }
     logger.warn(
       `Checkr is not fully configured (${checkrMissing.join(", ")} missing); ` +
-        `washer screenings will stay pending for operator decision`,
+        `the API will start but washer screenings will stay pending until Checkr is configured`,
     );
   }
 

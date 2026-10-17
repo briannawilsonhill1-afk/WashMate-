@@ -52,7 +52,7 @@ describe("startup preflight", () => {
     ).toThrow(/STRIPE_WEBHOOK_SECRET/);
   });
 
-  it("requires the Checkr screening config in production", () => {
+  it("warns (not throws) for missing Checkr config in production", () => {
     expect(() =>
       assertRequiredEnv({
         ...base,
@@ -60,7 +60,7 @@ describe("startup preflight", () => {
         STRIPE_WEBHOOK_SECRET: "whsec_xxx",
         ALLOWED_DOMAINS: "washloop.net",
       }),
-    ).toThrow(/CHECKR_API_KEY.*CHECKR_WEBHOOK_SECRET.*CHECKR_PACKAGE/);
+    ).not.toThrow();
   });
 
   it("warns (not throws) for missing Checkr config outside production", () => {
