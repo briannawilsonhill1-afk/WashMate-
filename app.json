@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "9d8f5b69-6caf-40bc-876d-2ceca69b92d6"
+      }
+    },
+    "android": {
+      "package": "com.bri631.workspace"
+    }
+  }
+}
