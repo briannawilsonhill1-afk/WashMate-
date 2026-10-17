@@ -92,12 +92,46 @@ export const washerProfiles = pgTable("washer_profiles", {
   verifiedAccountLast4: text("verified_account_last4"),
   stripeVerifiedAt: timestamp("stripe_verified_at"),
   agreedToTerms: boolean("agreed_to_terms").notNull().default(false),
+  // Stripe Connect Terms-of-Service acceptance evidence. Recorded server-side
+  // when the washer agrees to the washer terms, using the client IP observed
+  // at the trusted proxy boundary. This evidence is required before a
+  // Connect account is created — it is never fabricated or defaulted.
+  tosAcceptedAt: timestamp("tos_accepted_at"),
+  tosAcceptedIp: text("tos_accepted_ip"),
+  tosVersion: text("tos_version"),
   county: text("county"),
   state: text("state"),
   bgCheckConsent: boolean("bg_check_consent").notNull().default(false),
   bgSelfCertify: boolean("bg_self_certify").notNull().default(false),
-  bgCheckStatus: text("bg_check_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed'] }).notNull().default('not_started'),
+  bgCheckStatus: text("bg_check_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed', 'pre_adverse_action', 'adverse_action_final'] }).notNull().default('not_started'),
   bgCheckDate: timestamp("bg_check_date"),
+  // Checkr screening workflow state. All of these are server-managed: they
+  // are set only by the Checkr invitation flow and the verified Checkr
+  // webhook, and must never be writable from client input or returned to
+  // clients. Only coarse outcome data is stored — never report details.
+  bgCheckProvider: text("bg_check_provider"),
+  checkrCandidateId: text("checkr_candidate_id"),
+  checkrInvitationId: text("checkr_invitation_id"),
+  checkrReportId: text("checkr_report_id"),
+  bgCheckRequestedAt: timestamp("bg_check_requested_at"),
+  bgCheckDecidedAt: timestamp("bg_check_decided_at"),
+  bgCheckResult: text("bg_check_result", { enum: ['clear', 'consider', 'suspended'] }),
+  // FCRA written-authorization evidence. The standalone disclosure is shown on
+  // its own screen and the authorization is a separate, explicit act recorded
+  // here with timestamp + client IP + the disclosure version the washer saw.
+  // Server-managed: never writable from client input, IP never returned to clients.
+  // Screening cannot start without a valid authorization (fail-closed).
+  fcraDisclosureVersion: text("fcra_disclosure_version"),
+  fcraAuthorizedAt: timestamp("fcra_authorized_at"),
+  fcraAuthorizedIp: text("fcra_authorized_ip"),
+  // Adverse-action workflow state. When a report comes back "consider", the
+  // washer is flagged; before any final decision, an admin sends a pre-adverse
+  // notice, waits the configured business-day period, then records the final
+  // decision. Every transition is audited in washer_bg_check_events.
+  preAdverseSentAt: timestamp("pre_adverse_sent_at"),
+  preAdverseNoticeVersion: text("pre_adverse_notice_version"),
+  adverseActionFinalAt: timestamp("adverse_action_final_at"),
+  adverseActionNoticeVersion: text("adverse_action_notice_version"),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
@@ -107,9 +141,9 @@ export const washerProfiles = pgTable("washer_profiles", {
 export const washerBgCheckEvents = pgTable("washer_bg_check_events", {
   id: serial("id").primaryKey(),
   washerId: varchar("washer_id").notNull(),
-  fromStatus: text("from_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed'] }),
-  toStatus: text("to_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed'] }).notNull(),
-  actorType: text("actor_type", { enum: ['washer', 'operator', 'provider', 'system'] }).notNull(),
+  fromStatus: text("from_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed', 'pre_adverse_action', 'adverse_action_final'] }),
+  toStatus: text("to_status", { enum: ['not_started', 'pending', 'cleared', 'flagged', 'provider_failed', 'pre_adverse_action', 'adverse_action_final'] }).notNull(),
+  actorType: text("actor_type", { enum: ['washer', 'operator', 'provider', 'system', 'admin'] }).notNull(),
   actorId: varchar("actor_id"),
   providerReference: text("provider_reference"),
   reasonCode: text("reason_code").notNull(),
@@ -133,6 +167,33 @@ export const insertWasherProfileSchema = createInsertSchema(washerProfiles).omit
   verifiedBankName: true,
   verifiedAccountLast4: true,
   stripeVerifiedAt: true,
+  // ToS acceptance evidence is server-managed (captured from the request at
+  // the trusted proxy boundary when the washer agrees) and must never be
+  // writable from client input.
+  tosAcceptedAt: true,
+  tosAcceptedIp: true,
+  tosVersion: true,
+  // Checkr screening workflow state is server-managed (set by the invitation
+  // flow and the verified Checkr webhook) and must never be writable from
+  // client input.
+  bgCheckProvider: true,
+  checkrCandidateId: true,
+  checkrInvitationId: true,
+  checkrReportId: true,
+  bgCheckRequestedAt: true,
+  bgCheckDecidedAt: true,
+  bgCheckResult: true,
+  // FCRA authorization evidence and adverse-action workflow state are
+  // server-managed (recorded from the standalone disclosure/authorization
+  // flow and admin adverse-action endpoints) and must never be writable from
+  // client input.
+  fcraDisclosureVersion: true,
+  fcraAuthorizedAt: true,
+  fcraAuthorizedIp: true,
+  preAdverseSentAt: true,
+  preAdverseNoticeVersion: true,
+  adverseActionFinalAt: true,
+  adverseActionNoticeVersion: true,
 });
 
 export const profileUpdateSchema = z.object({

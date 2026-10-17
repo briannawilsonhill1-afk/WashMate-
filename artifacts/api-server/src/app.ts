@@ -9,6 +9,7 @@ import {
   clerkAuthMiddleware,
 } from "./auth";
 import { mountStripeWebhook } from "./routes/stripeWebhook";
+import { mountCheckrWebhook } from "./routes/checkrWebhook";
 
 /**
  * Build the set of origins that are allowed to make credentialed cross-origin
@@ -84,6 +85,9 @@ app.use(CLERK_PROXY_PATH, clerkProxyMiddleware());
 // silently corrupt signature verification (constructEvent on a parsed body
 // always fails) and effectively disable the webhook.
 mountStripeWebhook(app);
+// Same raw-body requirement for the Checkr screening webhook: signature
+// verification runs over the exact bytes Checkr sent.
+mountCheckrWebhook(app);
 
 app.use(
   cors({

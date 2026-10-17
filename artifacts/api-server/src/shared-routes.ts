@@ -4,6 +4,7 @@ import { insertOrderSchema, insertWasherProfileSchema, profileUpdateSchema, orde
 export const errorSchemas = {
   validation: z.object({ message: z.string(), field: z.string().optional() }),
   notFound: z.object({ message: z.string() }),
+  forbidden: z.object({ message: z.string() }),
   internal: z.object({ message: z.string() }),
 };
 
@@ -17,7 +18,16 @@ export type WasherProfileResponse = Omit<FullWasherProfile, 'taxId' | 'routingNu
   routingNumber: typeof SENSITIVE_FIELD_MASK | null;
   accountNumber: typeof SENSITIVE_FIELD_MASK | null;
 };
-export type WasherBgCheckStatusResponse = Pick<FullWasherProfile, 'bgCheckStatus'>;
+export type WasherBgCheckStatusResponse = Pick<FullWasherProfile, 'bgCheckStatus' | 'fcraDisclosureVersion'> & {
+  fcraAuthorized: boolean;
+  fcraDisclosureCurrent: string;
+  adverseAction: {
+    status: 'pre_adverse_action' | 'adverse_action_final';
+    preAdverseSentAt: Date | null;
+    waitDays: number;
+    remainingBusinessDays: number;
+  } | null;
+};
 
 export const api = {
   profile: {
@@ -116,6 +126,29 @@ export const api = {
       responses: {
         200: z.object({ clientSecret: z.string(), publishableKey: z.string() }),
         400: errorSchemas.validation,
+      }
+    },
+    fcraDisclosure: {
+      method: 'GET' as const,
+      path: '/api/washer/screening/fcra-disclosure' as const,
+      responses: {
+        200: z.object({ version: z.string(), text: z.string() }),
+      }
+    },
+    fcraAuthorize: {
+      method: 'POST' as const,
+      path: '/api/washer/screening/fcra-authorize' as const,
+      input: z.object({ authorized: z.literal(true) }),
+      responses: {
+        200: z.object({
+          authorized: z.boolean(),
+          version: z.string().nullable(),
+          authorizedAt: z.coerce.date().nullable(),
+          bgCheckStatus: z.string(),
+        }),
+        400: errorSchemas.validation,
+        403: errorSchemas.forbidden,
+        404: errorSchemas.notFound,
       }
     },
     fcComplete: {

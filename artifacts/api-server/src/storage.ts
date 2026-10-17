@@ -5,6 +5,15 @@ import type { Order, InsertOrder, WasherProfile, InsertWasherProfile, User, Payo
 import { eq, and, isNull, inArray, sql, desc } from "drizzle-orm";
 import { encryptField, decryptField, isEncrypted } from "./encryption";
 import type { CustomerUnlockRepository, UnlockUser } from "./customerUnlock";
+import { WASHER_TOS_VERSION } from "./lib/tos";
+import {
+  ADVERSE_ACTION_WAIT_DAYS_DEFAULT,
+  canCompleteAdverseAction,
+  getAdverseActionWaitDays,
+  getAllowedAdverseTransitions,
+  isFcraAuthorized,
+  type AdverseActionReadiness,
+} from "./lib/fcra";
 
 export interface EarningsSummary {
   unpaidEarningsCents: number;
@@ -20,7 +29,7 @@ export type WasherBgCheckEvent = {
   washerId: string;
   fromStatus: WasherProfile['bgCheckStatus'] | null;
   toStatus: WasherProfile['bgCheckStatus'];
-  actorType: 'washer' | 'operator' | 'provider' | 'system';
+  actorType: 'washer' | 'operator' | 'provider' | 'system' | 'admin';
   actorId: string | null;
   providerReference: string | null;
   reasonCode: string;
@@ -83,13 +92,29 @@ export interface IStorage {
 
   getWasherProfile(userId: string): Promise<WasherProfile | undefined>;
   getWasherBgCheckStatus(userId: string): Promise<{ bgCheckStatus: WasherProfile['bgCheckStatus'] } | undefined>;
-  upsertWasherProfile(profile: InsertWasherProfile & { userId: string }): Promise<WasherProfile>;
+  upsertWasherProfile(profile: InsertWasherProfile & { userId: string }, opts?: { clientIp?: string }): Promise<WasherProfile>;
+  recordTosAcceptance(userId: string, evidence: { ip: string; version: string }): Promise<void>;
   transitionWasherBgCheck(userId: string, input: {
     toStatus: WasherBgCheckDecision;
     actorId: string;
     providerReference?: string | null;
     reasonCode: string;
   }): Promise<WasherProfile>;
+  recordFcraAuthorization(userId: string, input: { ip: string | null; version: string }): Promise<WasherProfile>;
+  transitionAdverseAction(userId: string, input: {
+    toStatus: 'pre_adverse_action' | 'adverse_action_final' | 'cleared';
+    actorId: string;
+    reasonCode: string;
+    noticeVersion?: string | null;
+    waitDays?: number;
+    now?: Date;
+  }): Promise<WasherProfile>;
+  getAdverseActionInfo(userId: string, waitDays?: number): Promise<{
+    bgCheckStatus: WasherProfile['bgCheckStatus'];
+    preAdverseSentAt: Date | null;
+    waitDays: number;
+    readiness: { allowed: boolean; businessDaysElapsed: number; waitDays: number; remainingBusinessDays: number };
+  } | undefined>;
   resubmitWasherBgCheck(userId: string, actorId: string): Promise<WasherProfile>;
   getWasherBgCheckEvents(userId: string): Promise<WasherBgCheckEvent[]>;
   setStripeCustomerId(userId: string, stripeCustomerId: string): Promise<void>;
@@ -296,8 +321,12 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
   async transitionWasherBgCheck(userId: string, input: {
     toStatus: WasherBgCheckDecision;
     actorId: string;
+    actorType?: 'operator' | 'provider';
     providerReference?: string | null;
     reasonCode: string;
+    // Coarse provider decision details. Only the high-level outcome is
+    // persisted — never report contents or screening details.
+    decision?: { result: 'clear' | 'consider' | 'suspended'; reportId: string };
   }): Promise<WasherProfile> {
     return db.transaction(async (tx) => {
       await tx.execute(sql`SELECT id FROM washer_profiles WHERE user_id = ${userId} FOR UPDATE`);
@@ -310,7 +339,18 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
 
       const [updated] = await tx
         .update(washerProfiles)
-        .set({ bgCheckStatus: input.toStatus, bgCheckDate: new Date(), updatedAt: new Date() })
+        .set({
+          bgCheckStatus: input.toStatus,
+          bgCheckDate: new Date(),
+          updatedAt: new Date(),
+          ...(input.decision
+            ? {
+                checkrReportId: input.decision.reportId,
+                bgCheckResult: input.decision.result,
+                bgCheckDecidedAt: new Date(),
+              }
+            : {}),
+        })
         .where(eq(washerProfiles.userId, userId))
         .returning();
       if (!updated) throw new Error('WASHER_PROFILE_NOT_FOUND');
@@ -319,13 +359,255 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
         washerId: userId,
         fromStatus: profile.bgCheckStatus,
         toStatus: input.toStatus,
-        actorType: 'operator',
+        actorType: input.actorType ?? 'operator',
         actorId: input.actorId,
         providerReference: input.providerReference ?? null,
         reasonCode: input.reasonCode,
       });
       return decryptSensitiveFields(updated);
     });
+  }
+
+  /**
+   * Record a washer's written FCRA authorization from the standalone
+   * disclosure flow.
+   *
+   * The disclosure is presented on its own screen and the authorization is a
+   * separate, explicit act. This method records the evidence server-side:
+   * timestamp, client IP observed at the trusted proxy boundary, and the
+   * disclosure version the washer saw. It also sets bgCheckConsent=true so
+   * the two can never disagree — screening consent exists if and only if a
+   * valid written authorization exists.
+   *
+   * Authorizing completes the screening submission when the rest of the
+   * profile is already complete (self-certification + county + state): the
+   * status moves not_started -> pending so the screening can start. If the
+   * profile is incomplete, the next profile save performs the submission.
+   *
+   * Idempotent: re-authorizing under the same current version only
+   * re-evaluates the submission — it never rewrites the original timestamp.
+   * This is process mechanics, not a legal conclusion — counsel must review
+   * the disclosure text and flow before live screenings.
+   */
+  async recordFcraAuthorization(
+    userId: string,
+    input: { ip: string | null; version: string },
+  ): Promise<WasherProfile> {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM washer_profiles WHERE user_id = ${userId} FOR UPDATE`);
+      const [profile] = await tx.select().from(washerProfiles).where(eq(washerProfiles.userId, userId));
+      if (!profile) throw new Error('WASHER_PROFILE_NOT_FOUND');
+
+      const events: typeof washerBgCheckEvents.$inferInsert[] = [];
+      let updated = profile;
+      if (!(isFcraAuthorized(profile) && profile.fcraDisclosureVersion === input.version)) {
+        const now = new Date();
+        [updated] = await tx
+          .update(washerProfiles)
+          .set({
+            bgCheckConsent: true,
+            fcraDisclosureVersion: input.version,
+            fcraAuthorizedAt: now,
+            fcraAuthorizedIp: input.ip,
+            updatedAt: now,
+          })
+          .where(eq(washerProfiles.userId, userId))
+          .returning();
+        if (!updated) throw new Error('WASHER_PROFILE_NOT_FOUND');
+        events.push({
+          washerId: userId,
+          fromStatus: profile.bgCheckStatus,
+          toStatus: profile.bgCheckStatus,
+          actorType: 'washer',
+          actorId: userId,
+          providerReference: null,
+          reasonCode: 'fcra_authorized',
+        });
+      }
+
+      if (
+        updated.bgCheckStatus === 'not_started' &&
+        updated.bgSelfCertify &&
+        updated.county &&
+        updated.state
+      ) {
+        const now = new Date();
+        [updated] = await tx
+          .update(washerProfiles)
+          .set({ bgCheckStatus: 'pending', bgCheckDate: now, updatedAt: now })
+          .where(eq(washerProfiles.userId, userId))
+          .returning();
+        if (!updated) throw new Error('WASHER_PROFILE_NOT_FOUND');
+        events.push({
+          washerId: userId,
+          fromStatus: 'not_started',
+          toStatus: 'pending',
+          actorType: 'washer',
+          actorId: userId,
+          providerReference: null,
+          reasonCode: 'screening_submitted',
+        });
+      }
+
+      for (const event of events) {
+        await tx.insert(washerBgCheckEvents).values(event);
+      }
+      return decryptSensitiveFields(updated);
+    });
+  }
+
+  /**
+   * Adverse-action state machine for flagged screenings.
+   *
+   * Mechanics (NOT legal advice — counsel must review the workflow, notice
+   * text, and waiting period before live use):
+   *   flagged --(admin)--> pre_adverse_action   [pre-adverse notice generated]
+   *   pre_adverse_action --(admin, waiting elapsed)--> adverse_action_final
+   *   flagged|pre_adverse_action --(admin)--> cleared   [dispute resolved]
+   *
+   * Terminal states (cleared, adverse_action_final) never regress. The
+   * waiting period is enforced server-side in business days; completing early
+   * throws ADVERSE_ACTION_WAIT_NOT_ELAPSED. Every transition is audited with
+   * actorType 'admin'.
+   */
+  async transitionAdverseAction(userId: string, input: {
+    toStatus: 'pre_adverse_action' | 'adverse_action_final' | 'cleared';
+    actorId: string;
+    reasonCode: string;
+    noticeVersion?: string | null;
+    waitDays?: number;
+    now?: Date;
+  }): Promise<WasherProfile> {
+    const now = input.now ?? new Date();
+    const waitDays = input.waitDays ?? ADVERSE_ACTION_WAIT_DAYS_DEFAULT;
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM washer_profiles WHERE user_id = ${userId} FOR UPDATE`);
+      const [profile] = await tx.select().from(washerProfiles).where(eq(washerProfiles.userId, userId));
+      if (!profile) throw new Error('WASHER_PROFILE_NOT_FOUND');
+      if (!getAllowedAdverseTransitions(profile.bgCheckStatus).includes(input.toStatus)) {
+        throw new Error('ADVERSE_ACTION_TRANSITION_NOT_ALLOWED');
+      }
+      if (input.toStatus === 'adverse_action_final') {
+        const readiness = canCompleteAdverseAction(profile.preAdverseSentAt, waitDays, now);
+        if (!readiness.allowed) {
+          const err = new Error('ADVERSE_ACTION_WAIT_NOT_ELAPSED') as Error & {
+            remainingBusinessDays?: number;
+          };
+          err.remainingBusinessDays = readiness.remainingBusinessDays;
+          throw err;
+        }
+      }
+
+      const [updated] = await tx
+        .update(washerProfiles)
+        .set({
+          bgCheckStatus: input.toStatus,
+          bgCheckDate: now,
+          updatedAt: now,
+          ...(input.toStatus === 'pre_adverse_action'
+            ? { preAdverseSentAt: now, preAdverseNoticeVersion: input.noticeVersion ?? null }
+            : {}),
+          ...(input.toStatus === 'adverse_action_final'
+            ? { adverseActionFinalAt: now, adverseActionNoticeVersion: input.noticeVersion ?? null }
+            : {}),
+        })
+        .where(eq(washerProfiles.userId, userId))
+        .returning();
+      if (!updated) throw new Error('WASHER_PROFILE_NOT_FOUND');
+
+      await tx.insert(washerBgCheckEvents).values({
+        washerId: userId,
+        fromStatus: profile.bgCheckStatus,
+        toStatus: input.toStatus,
+        actorType: 'admin',
+        actorId: input.actorId,
+        providerReference: null,
+        reasonCode: input.reasonCode,
+      });
+      return decryptSensitiveFields(updated);
+    });
+  }
+
+  /**
+   * Adverse-action status detail for a washer: current status, when the
+   * pre-adverse notice was sent, and whether the waiting period has elapsed.
+   */
+  async getAdverseActionInfo(userId: string, waitDays?: number): Promise<{
+    bgCheckStatus: WasherProfile['bgCheckStatus'];
+    preAdverseSentAt: Date | null;
+    waitDays: number;
+    readiness: AdverseActionReadiness;
+  } | undefined> {
+    const [profile] = await db
+      .select({
+        bgCheckStatus: washerProfiles.bgCheckStatus,
+        preAdverseSentAt: washerProfiles.preAdverseSentAt,
+      })
+      .from(washerProfiles)
+      .where(eq(washerProfiles.userId, userId));
+    if (!profile) return undefined;
+    const days = waitDays ?? getAdverseActionWaitDays();
+    return {
+      bgCheckStatus: profile.bgCheckStatus,
+      preAdverseSentAt: profile.preAdverseSentAt,
+      waitDays: days,
+      readiness: canCompleteAdverseAction(profile.preAdverseSentAt, days),
+    };
+  }
+
+  /**
+   * Look up a washer by their Checkr candidate ID. Used by the verified
+   * Checkr webhook to find the local profile for a report event. Returns the
+   * decrypted profile or undefined when no washer is linked to the candidate.
+   */
+  async getWasherProfileByCheckrCandidateId(candidateId: string): Promise<WasherProfile | undefined> {
+    const [row] = await db
+      .select()
+      .from(washerProfiles)
+      .where(eq(washerProfiles.checkrCandidateId, candidateId));
+    return row ? decryptSensitiveFields(row) : undefined;
+  }
+
+  /**
+   * Record a Checkr candidate + invitation for a washer whose screening was
+   * submitted. Only touches the server-managed screening columns; the status
+   * itself is left alone (it is already 'pending' when this is called).
+   */
+  async setCheckrScreeningRequest(
+    userId: string,
+    ids: { candidateId: string; invitationId: string },
+  ): Promise<void> {
+    await db
+      .update(washerProfiles)
+      .set({
+        bgCheckProvider: 'checkr',
+        checkrCandidateId: ids.candidateId,
+        checkrInvitationId: ids.invitationId,
+        bgCheckRequestedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(washerProfiles.userId, userId));
+  }
+
+  /**
+   * Clear a stored Checkr invitation ID (e.g. after it expires) so a fresh
+   * invitation can be issued. Only clears when the stored ID matches and the
+   * screening is still pending — never touches a decided screening.
+   * Returns true when the invitation was cleared.
+   */
+  async clearCheckrInvitation(userId: string, invitationId: string): Promise<boolean> {
+    const [updated] = await db
+      .update(washerProfiles)
+      .set({ checkrInvitationId: null, updatedAt: new Date() })
+      .where(
+        and(
+          eq(washerProfiles.userId, userId),
+          eq(washerProfiles.checkrInvitationId, invitationId),
+          eq(washerProfiles.bgCheckStatus, 'pending'),
+        ),
+      )
+      .returning({ id: washerProfiles.id });
+    return Boolean(updated);
   }
 
   async resubmitWasherBgCheck(userId: string, actorId: string): Promise<WasherProfile> {
@@ -528,6 +810,21 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
       .where(eq(washerProfiles.userId, userId));
   }
 
+  // Persist fresh ToS acceptance evidence for a washer who previously agreed
+  // without recorded evidence (pre-evidence rows). Used only with a real
+  // client IP from an in-session request — never with a fabricated address.
+  async recordTosAcceptance(userId: string, evidence: { ip: string; version: string }): Promise<void> {
+    await db.update(washerProfiles)
+      .set({
+        agreedToTerms: true,
+        tosAcceptedAt: new Date(),
+        tosAcceptedIp: evidence.ip,
+        tosVersion: evidence.version,
+        updatedAt: new Date(),
+      })
+      .where(eq(washerProfiles.userId, userId));
+  }
+
   async getPayout(payoutId: number): Promise<Payout | undefined> {
     const [row] = await db.select().from(payouts).where(eq(payouts.id, payoutId));
     return row;
@@ -613,7 +910,7 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
     });
   }
 
-  async upsertWasherProfile(profile: InsertWasherProfile & { userId: string }): Promise<WasherProfile> {
+  async upsertWasherProfile(profile: InsertWasherProfile & { userId: string }, opts?: { clientIp?: string }): Promise<WasherProfile> {
     return db.transaction(async (tx) => {
       await tx.execute(sql`SELECT id FROM users WHERE id = ${profile.userId} FOR UPDATE`);
       const [existing] = await tx.select().from(washerProfiles).where(eq(washerProfiles.userId, profile.userId));
@@ -621,12 +918,32 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
       // Status and date are omitted from InsertWasherProfile and are exclusively
       // derived here. A washer may submit a new screening only from
       // not_started; provider decisions and resubmissions use operator routes.
+      //
+      // Screening submission now keys off the server-recorded FCRA written
+      // authorization (standalone disclosure flow), not the client-sent
+      // consent flag — the client flag is legacy and is never allowed to
+      // downgrade or contradict the server-side authorization evidence.
       let serverVerification: Partial<typeof washerProfiles.$inferInsert> = {};
       let auditEvent: typeof washerBgCheckEvents.$inferInsert | undefined;
-      const completeSubmission = Boolean(profile.bgCheckConsent && profile.bgSelfCertify && profile.county && profile.state);
+      const fcraAuthorized = existing ? isFcraAuthorized(existing) : false;
+      const completeSubmission = Boolean(fcraAuthorized && profile.bgSelfCertify && profile.county && profile.state);
+
+      // Capture ToS acceptance evidence at the moment the washer agrees: the
+      // timestamp, the client IP observed at the trusted proxy boundary, and
+      // the terms version. This evidence is required before a Stripe Connect
+      // account is created and is never fabricated server-side.
+      const newlyAgreedToTerms = Boolean(profile.agreedToTerms) && !existing?.agreedToTerms;
+      if (newlyAgreedToTerms) {
+        serverVerification = {
+          ...serverVerification,
+          tosAcceptedAt: new Date(),
+          tosAcceptedIp: opts?.clientIp ?? null,
+          tosVersion: WASHER_TOS_VERSION,
+        };
+      }
 
       if (completeSubmission && (!existing || existing.bgCheckStatus === 'not_started')) {
-        serverVerification = { bgCheckStatus: 'pending', bgCheckDate: new Date() };
+        serverVerification = { ...serverVerification, bgCheckStatus: 'pending', bgCheckDate: new Date() };
         auditEvent = {
           washerId: profile.userId,
           fromStatus: existing?.bgCheckStatus ?? null,
@@ -638,12 +955,14 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
         };
       } else if (
         existing &&
-        (!profile.bgCheckConsent || !profile.bgSelfCertify) &&
+        !profile.bgSelfCertify &&
         existing.bgCheckStatus !== 'not_started'
       ) {
-        // Consent/self-certification withdrawal immediately removes eligibility.
-        // This is not a provider decision; it is recorded as a user withdrawal.
-        serverVerification = { bgCheckStatus: 'not_started', bgCheckDate: null };
+        // Self-certification withdrawal immediately removes eligibility. This
+        // is not a provider decision; it is recorded as a user withdrawal.
+        // (Screening consent itself is the server-recorded FCRA authorization
+        // and cannot be withdrawn through the profile form.)
+        serverVerification = { ...serverVerification, bgCheckStatus: 'not_started', bgCheckDate: null };
         auditEvent = {
           washerId: profile.userId,
           fromStatus: existing.bgCheckStatus,
@@ -651,18 +970,24 @@ export class DatabaseStorage implements IStorage, CustomerUnlockRepository {
           actorType: 'washer',
           actorId: profile.userId,
           providerReference: null,
-          reasonCode: !profile.bgCheckConsent ? 'consent_withdrawn' : 'self_certification_withdrawn',
+          reasonCode: 'self_certification_withdrawn',
         };
       }
 
+      // The client-sent consent flag must never contradict the server-side
+      // FCRA authorization evidence: when a valid authorization exists, the
+      // stored flag is forced true so a stale form save cannot revoke it.
       const encryptedProfile = encryptSensitiveFields(profile);
+      const profileWrite = fcraAuthorized
+        ? { ...encryptedProfile, bgCheckConsent: true }
+        : encryptedProfile;
       const saved = existing
         ? (await tx.update(washerProfiles)
-            .set({ ...encryptedProfile, ...serverVerification, updatedAt: new Date() })
+            .set({ ...profileWrite, ...serverVerification, updatedAt: new Date() })
             .where(eq(washerProfiles.userId, profile.userId))
             .returning())[0]
         : (await tx.insert(washerProfiles)
-            .values({ ...encryptedProfile, ...serverVerification })
+            .values({ ...profileWrite, ...serverVerification })
             .returning())[0];
 
       if (auditEvent) await tx.insert(washerBgCheckEvents).values(auditEvent);

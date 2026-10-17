@@ -5,6 +5,7 @@ import { setupAuth, registerAuthRoutes } from "./auth";
 import { registerRoutes } from "./routes/routes";
 import healthRouter from "./routes/health";
 import { registerActiveUserRoutes, trackActiveUser } from "./activeUsers";
+import { assertRequiredEnv } from "./lib/env";
 
 function assertClerkEnv() {
   const missing: string[] = [];
@@ -27,6 +28,7 @@ let ready: Promise<{ app: Express; server: http.Server }> | undefined;
  */
 export function initApp(): Promise<{ app: Express; server: http.Server }> {
   ready ??= (async () => {
+    assertRequiredEnv();
     assertClerkEnv();
     await setupAuth(app);
     app.use("/api", healthRouter);

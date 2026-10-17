@@ -12,6 +12,22 @@ import {
   notifyOrderStatusChange,
 } from "../push";
 import { extractPickupArea } from "../lib/address-privacy";
+import { resolveClientIp } from "../lib/tos";
+import { getCheckrConfig, startWasherScreening } from "../lib/checkr";
+import {
+  FCRA_DISCLOSURE_VERSION,
+  FCRA_NOTICE_VERSION,
+  addBusinessDays,
+  getAdverseActionWaitDays,
+  getFcraBusinessDetails,
+  isFcraAuthorized,
+} from "../lib/fcra";
+import { renderFcraDisclosureText } from "../lib/fcraDisclosure";
+import {
+  CFPB_RIGHTS_URL,
+  renderAdverseActionNotice,
+  renderPreAdverseNotice,
+} from "../lib/fcraNotices";
 import { getUncachableStripeClient, getStripePublishableKey } from "../stripeClient";
 import {
   executePayout,
@@ -76,8 +92,22 @@ function sanitizePendingOrderForWasher(order: { id: number; status: string; load
 function maskWasherProfile(profile: WasherProfile) {
   // Preserve null/empty so the client can tell whether a value exists. When
   // present, replace with the sentinel mask so secrets never reach the client.
+  // ToS acceptance IP is compliance evidence, not client data — never expose it.
+  // Checkr screening identifiers and workflow state are likewise internal.
+  // FCRA authorization evidence (IP) is never exposed; the authorized flag is
+  // safe for the washer's own UI.
   return {
     ...profile,
+    tosAcceptedIp: null,
+    bgCheckProvider: null,
+    checkrCandidateId: null,
+    checkrInvitationId: null,
+    checkrReportId: null,
+    bgCheckRequestedAt: null,
+    bgCheckDecidedAt: null,
+    bgCheckResult: null,
+    fcraAuthorizedIp: null,
+    fcraAuthorized: isFcraAuthorized(profile),
     taxId: profile.taxId ? SENSITIVE_FIELD_MASK : null,
     routingNumber: profile.routingNumber ? SENSITIVE_FIELD_MASK : null,
     accountNumber: profile.accountNumber ? SENSITIVE_FIELD_MASK : null,
@@ -404,7 +434,26 @@ export async function registerRoutes(
     if (!status) {
       return res.status(404).json({ message: "Washer profile not found" });
     }
-    return res.status(200).json(status);
+    // Non-sensitive screening state for the washer's own UI: authorization
+    // state (so the UI can prompt re-authorization) and adverse-action
+    // waiting info. Never expose report details or evidence IPs.
+    const profile = await storage.getWasherProfile(userId);
+    const waitDays = getAdverseActionWaitDays();
+    const adverse = await storage.getAdverseActionInfo(userId, waitDays);
+    return res.status(200).json({
+      ...status,
+      fcraAuthorized: isFcraAuthorized(profile),
+      fcraDisclosureVersion: profile?.fcraDisclosureVersion ?? null,
+      fcraDisclosureCurrent: FCRA_DISCLOSURE_VERSION,
+      adverseAction: adverse && (adverse.bgCheckStatus === "pre_adverse_action" || adverse.bgCheckStatus === "adverse_action_final")
+        ? {
+            status: adverse.bgCheckStatus,
+            preAdverseSentAt: adverse.preAdverseSentAt,
+            waitDays: adverse.waitDays,
+            remainingBusinessDays: adverse.readiness.remainingBusinessDays,
+          }
+        : null,
+    });
   });
 
   // Screening decisions are deliberately not part of the washer profile API.
@@ -438,11 +487,169 @@ export async function registerRoutes(
     }
   });
 
+  // Adverse-action workflow (admin only).
+  //
+  // Mechanics, NOT legal advice: when a report comes back "consider", the
+  // washer is `flagged`. Before any final adverse decision, federal guidance
+  // describes a pre-adverse notice (report copy + Summary of Rights + time to
+  // respond), a waiting period, then a final notice. This code enforces the
+  // sequence and the waiting period server-side and audits every step. It
+  // does NOT make WashMate compliant — employment counsel must review the
+  // templates, waiting period, and process before live use.
+  //
+  // Notice DELIVERY (email/mail to the washer) is an operational step the
+  // admin completes outside this endpoint; the generated notice text is
+  // returned here and its version + timestamp are recorded in the database.
+  function handleAdverseActionError(err: any, res: any) {
+    if (err?.message === "WASHER_PROFILE_NOT_FOUND") {
+      return res.status(404).json({ message: "Washer profile not found" });
+    }
+    if (err?.message === "ADVERSE_ACTION_TRANSITION_NOT_ALLOWED") {
+      return res.status(409).json({ message: "This adverse-action step is not allowed from the washer's current status." });
+    }
+    if (err?.message === "ADVERSE_ACTION_WAIT_NOT_ELAPSED") {
+      return res.status(409).json({
+        message: `The waiting period has not elapsed. ${err.remainingBusinessDays ?? "?"} business day(s) remain.`,
+        remainingBusinessDays: err.remainingBusinessDays ?? null,
+      });
+    }
+    throw err;
+  }
+
+  function formatNoticeDate(d: Date): string {
+    return d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+  }
+
+  // Step 1: send the pre-adverse notice. Requires status `flagged`.
+  // Fail-closed: refuses when FCRA business details are still placeholders,
+  // so a notice can never go out addressed from "[BUSINESS NAME]".
+  app.post('/api/admin/washer-screening/:userId/pre-adverse', isAuthenticated, async (req: any, res) => {
+    const operatorId = getUserId(req);
+    if (!isAdmin(operatorId)) return res.status(403).json({ message: "Admin only" });
+    try {
+      const details = getFcraBusinessDetails();
+      if (!details.isConfigured) {
+        return res.status(409).json({
+          message: "Configure FCRA_BUSINESS_NAME, FCRA_BUSINESS_ADDRESS, and FCRA_BUSINESS_PHONE before generating adverse-action notices.",
+        });
+      }
+      const waitDays = getAdverseActionWaitDays();
+      const profile = await storage.transitionAdverseAction(req.params.userId, {
+        toStatus: "pre_adverse_action",
+        actorId: operatorId,
+        reasonCode: "pre_adverse_notice_sent",
+        noticeVersion: FCRA_NOTICE_VERSION,
+        waitDays,
+      });
+      const sentAt = new Date();
+      const notice = renderPreAdverseNotice({
+        businessName: details.businessName,
+        businessAddress: details.businessAddress,
+        businessPhone: details.businessPhone,
+        craName: details.craName,
+        craAddress: details.craAddress,
+        craPhone: details.craPhone,
+        candidateName: profile.legalName || "Applicant",
+        noticeDate: formatNoticeDate(sentAt),
+        responseDeadline: formatNoticeDate(addBusinessDays(sentAt, waitDays)),
+      });
+      return res.status(200).json({
+        userId: profile.userId,
+        bgCheckStatus: profile.bgCheckStatus,
+        preAdverseSentAt: profile.preAdverseSentAt,
+        waitBusinessDays: waitDays,
+        noticeVersion: FCRA_NOTICE_VERSION,
+        cfpRightsUrl: CFPB_RIGHTS_URL,
+        notice,
+        deliveryNote: "Deliver this notice to the washer along with a copy of the Checkr report. Delivery is an operational step outside this endpoint.",
+      });
+    } catch (err: any) {
+      return handleAdverseActionError(err, res);
+    }
+  });
+
+  // Step 2: record the final adverse decision. Requires status
+  // `pre_adverse_action` AND the waiting period to have elapsed (enforced
+  // server-side in business days).
+  app.post('/api/admin/washer-screening/:userId/adverse-final', isAuthenticated, async (req: any, res) => {
+    const operatorId = getUserId(req);
+    if (!isAdmin(operatorId)) return res.status(403).json({ message: "Admin only" });
+    try {
+      const details = getFcraBusinessDetails();
+      if (!details.isConfigured) {
+        return res.status(409).json({
+          message: "Configure FCRA_BUSINESS_NAME, FCRA_BUSINESS_ADDRESS, and FCRA_BUSINESS_PHONE before generating adverse-action notices.",
+        });
+      }
+      const waitDays = getAdverseActionWaitDays();
+      const profile = await storage.transitionAdverseAction(req.params.userId, {
+        toStatus: "adverse_action_final",
+        actorId: operatorId,
+        reasonCode: "adverse_action_final",
+        noticeVersion: FCRA_NOTICE_VERSION,
+        waitDays,
+      });
+      const notice = renderAdverseActionNotice({
+        businessName: details.businessName,
+        businessAddress: details.businessAddress,
+        businessPhone: details.businessPhone,
+        craName: details.craName,
+        craAddress: details.craAddress,
+        craPhone: details.craPhone,
+        candidateName: profile.legalName || "Applicant",
+        noticeDate: formatNoticeDate(new Date()),
+      });
+      return res.status(200).json({
+        userId: profile.userId,
+        bgCheckStatus: profile.bgCheckStatus,
+        adverseActionFinalAt: profile.adverseActionFinalAt,
+        noticeVersion: FCRA_NOTICE_VERSION,
+        cfpRightsUrl: CFPB_RIGHTS_URL,
+        notice,
+        deliveryNote: "Deliver this notice to the washer. Delivery is an operational step outside this endpoint.",
+      });
+    } catch (err: any) {
+      return handleAdverseActionError(err, res);
+    }
+  });
+
+  // Dispute resolution: a flagged (or pre-adverse) washer whose dispute
+  // resolves favorably can be cleared by an admin with an explicit reason.
+  // This is the only path out of pre_adverse_action other than the final
+  // adverse decision; adverse_action_final is terminal and never regresses.
+  app.post('/api/admin/washer-screening/:userId/clear-dispute', isAuthenticated, async (req: any, res) => {
+    const operatorId = getUserId(req);
+    if (!isAdmin(operatorId)) return res.status(403).json({ message: "Admin only" });
+    try {
+      const profile = await storage.transitionAdverseAction(req.params.userId, {
+        toStatus: "cleared",
+        actorId: operatorId,
+        reasonCode: "dispute_resolved",
+      });
+      return res.status(200).json({ userId: profile.userId, bgCheckStatus: profile.bgCheckStatus });
+    } catch (err: any) {
+      return handleAdverseActionError(err, res);
+    }
+  });
+
   app.post('/api/admin/washer-screening/:userId/resubmit', isAuthenticated, async (req: any, res) => {
     const operatorId = getUserId(req);
     if (!isAdmin(operatorId)) return res.status(403).json({ message: "Admin only" });
     try {
       const profile = await storage.resubmitWasherBgCheck(req.params.userId, operatorId);
+      // Best-effort: a resubmission should re-screen via Checkr, not strand
+      // the washer in pending. Never fails the resubmit itself.
+      if (getCheckrConfig() && profile.state) {
+        try {
+          const clerkUser = await clerkClient.users.getUser(req.params.userId).catch(() => null);
+          const email = clerkUser?.emailAddresses?.[0]?.emailAddress;
+          if (email) {
+            await startWasherScreening({ userId: req.params.userId, email, state: profile.state });
+          }
+        } catch (err) {
+          req.log?.error({ err, userId: req.params.userId }, "Failed to start Checkr screening on resubmit");
+        }
+      }
       return res.status(200).json({ userId: profile.userId, bgCheckStatus: profile.bgCheckStatus });
     } catch (err: any) {
       if (err?.message === 'WASHER_PROFILE_NOT_FOUND') {
@@ -465,6 +672,27 @@ export async function registerRoutes(
     return res.status(200).json(events);
   });
 
+  // Best-effort Checkr screening start after a fresh submission. Never fails
+  // the caller's request: if Checkr is unconfigured or errors, the screening
+  // stays pending for an operator decision or a resend.
+  async function maybeStartCheckrScreening(userId: string, profile: { state: string | null }, req: any) {
+    if (!getCheckrConfig()) return;
+    try {
+      const clerkUser = await clerkClient.users.getUser(userId).catch(() => null);
+      const email = clerkUser?.emailAddresses?.[0]?.emailAddress;
+      if (email && profile.state) {
+        await startWasherScreening({ userId, email, state: profile.state });
+      } else {
+        req.log?.warn(
+          { userId },
+          "Skipping Checkr screening start: missing washer email or state",
+        );
+      }
+    } catch (err) {
+      req.log?.error({ err, userId }, "Failed to start Checkr screening; left pending");
+    }
+  }
+
   app.post(api.washerProfile.upsert.path, isAuthenticated, async (req: any, res) => {
     try {
       const userId = getUserId(req);
@@ -478,13 +706,133 @@ export async function registerRoutes(
         if (profileData.accountNumber === SENSITIVE_FIELD_MASK) profileData.accountNumber = existing.accountNumber;
       }
 
-      const profile = await storage.upsertWasherProfile({ ...profileData, userId });
+      const profile = await storage.upsertWasherProfile(
+        { ...profileData, userId },
+        // Capture the client IP at the trusted proxy boundary so ToS
+        // acceptance evidence is recorded when the washer agrees.
+        { clientIp: resolveClientIp(req) },
+      );
+
+      // A fresh screening submission (not_started → pending) kicks off the
+      // Checkr background check via the hosted invitation flow. This never
+      // fails the profile save: if Checkr is unconfigured or errors, the
+      // screening stays pending for an operator decision or a resend.
+      const newScreeningSubmission =
+        (!existing || existing.bgCheckStatus === "not_started") &&
+        profile.bgCheckStatus === "pending";
+      if (newScreeningSubmission) {
+        await maybeStartCheckrScreening(userId, profile, req);
+      }
       return res.status(200).json(maskWasherProfile(profile));
     } catch (err) {
       if (err instanceof z.ZodError) {
         return res.status(400).json({ message: err.errors[0].message, field: err.errors[0].path.join('.') });
       }
       throw err;
+    }
+  });
+
+  // Standalone FCRA disclosure text. This endpoint exists so the disclosure is
+  // served from one versioned source of truth and shown on its own screen —
+  // never bundled with other consents or terms. The text is a TEMPLATE that
+  // must be customized and reviewed by employment counsel before live use.
+  app.get("/api/washer/screening/fcra-disclosure", isAuthenticated, async (req: any, res) => {
+    const details = getFcraBusinessDetails();
+    return res.status(200).json({
+      version: FCRA_DISCLOSURE_VERSION,
+      text: renderFcraDisclosureText({
+        businessName: details.businessName,
+        businessAddress: details.businessAddress,
+        businessPhone: details.businessPhone,
+        craName: details.craName,
+      }),
+    });
+  });
+
+  // Record the washer's separate written FCRA authorization. This is a
+  // distinct, explicit act — not part of the profile form — and is recorded
+  // server-side with timestamp + client IP + disclosure version. Idempotent:
+  // re-authorizing under the current version only re-evaluates submission.
+  // When the profile is otherwise complete, authorizing also submits the
+  // screening (not_started → pending) and kicks off the Checkr invitation.
+  app.post("/api/washer/screening/fcra-authorize", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = getUserId(req);
+      const user = await storage.getUser(userId);
+      if (!user || user.role !== "washer") {
+        return res.status(403).json({ message: "Only washers can authorize screening" });
+      }
+      const parsed = z.object({ authorized: z.literal(true) }).safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Authorization must be explicitly confirmed." });
+      }
+      const before = await storage.getWasherProfile(userId);
+      if (!before) {
+        return res.status(404).json({ message: "Washer profile not found. Save your profile first." });
+      }
+      const profile = await storage.recordFcraAuthorization(userId, {
+        ip: resolveClientIp(req) ?? null,
+        version: FCRA_DISCLOSURE_VERSION,
+      });
+      if (before.bgCheckStatus === "not_started" && profile.bgCheckStatus === "pending") {
+        await maybeStartCheckrScreening(userId, profile, req);
+      }
+      return res.status(200).json({
+        authorized: true,
+        version: profile.fcraDisclosureVersion,
+        authorizedAt: profile.fcraAuthorizedAt,
+        bgCheckStatus: profile.bgCheckStatus,
+      });
+    } catch (err: any) {
+      if (err?.message === "WASHER_PROFILE_NOT_FOUND") {
+        return res.status(404).json({ message: "Washer profile not found. Save your profile first." });
+      }
+      throw err;
+    }
+  });
+
+  // Resend (or first-send) the Checkr screening invitation for the caller's
+  // own pending screening — e.g. after the invitation email was missed or
+  // expired. This only ever *requests* a screening; it can never decide one.
+  // Status transitions happen exclusively via the verified Checkr webhook or
+  // an admin operator action.
+  app.post("/api/washer/screening/resend-invitation", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = getUserId(req);
+      const profile = await storage.getWasherProfile(userId);
+      if (!profile) {
+        return res.status(404).json({ message: "Washer profile not found" });
+      }
+      if (profile.bgCheckStatus !== "pending") {
+        return res.status(409).json({ message: "Only a pending screening can be resent." });
+      }
+      if (!getCheckrConfig()) {
+        return res.status(503).json({ message: "Screening provider is not configured." });
+      }
+      const clerkUser = await clerkClient.users.getUser(userId).catch(() => null);
+      const email = clerkUser?.emailAddresses?.[0]?.emailAddress;
+      if (!email || !profile.state) {
+        return res.status(409).json({ message: "Email and state are required to start screening." });
+      }
+      const result = await startWasherScreening({ userId, email, state: profile.state });
+      return res.status(200).json({
+        invitationSent: !result.invitationReused,
+        message: result.invitationReused
+          ? "Your screening invitation is still active — check your email."
+          : "Screening invitation sent — check your email to complete it.",
+      });
+    } catch (err: any) {
+      req.log?.error({ err }, "Failed to resend Checkr screening invitation");
+      if (err?.message === "CHECKR_INVALID_STATE") {
+        return res.status(409).json({ message: "A valid 2-letter state is required to start screening." });
+      }
+      if (err?.message === "FCRA_AUTHORIZATION_MISSING") {
+        return res.status(409).json({
+          message: "Complete the background check disclosure and authorization first.",
+          code: "FCRA_AUTHORIZATION_MISSING",
+        });
+      }
+      return res.status(502).json({ message: "Could not reach the screening provider. Please try again." });
     }
   });
 
@@ -588,7 +936,7 @@ export async function registerRoutes(
       // the first payout request goes through without an extra round-trip to
       // Stripe. If this fails (test-mode KYC quirks, etc.) we don't block the
       // verification — executePayout() will retry it at payout time.
-      ensureConnectAccount(userId).catch((err) => {
+      ensureConnectAccount(userId, { clientIp: resolveClientIp(req) }).catch((err) => {
         req.log?.warn({ err }, "ensureConnectAccount failed during FC complete (will retry on payout)");
       });
 
@@ -651,11 +999,14 @@ export async function registerRoutes(
       }
       const payout = await storage.requestPayout(userId);
       try {
-        await executePayout(payout.id);
+        await executePayout(payout.id, { clientIp: resolveClientIp(req) });
       } catch (err: any) {
         // executePayout has already marked the payout failed (and released its
         // orders) when it throws, so the database stays consistent. Surface a
         // 502 so the client knows the request didn't actually move money.
+        if (err instanceof PayoutError && err.code === "TOS_EVIDENCE_MISSING") {
+          return res.status(400).json({ message: err.message });
+        }
         req.log?.error({ err, payoutId: payout.id }, "executePayout failed");
         return res.status(502).json({ message: "Payout could not be sent to your bank. Please try again." });
       }

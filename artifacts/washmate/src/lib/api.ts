@@ -64,8 +64,11 @@ export interface WasherProfile {
   state?: string | null;
   bgCheckConsent: boolean;
   bgSelfCertify: boolean;
-  bgCheckStatus: 'not_started' | 'pending' | 'cleared' | 'flagged' | 'provider_failed';
+  bgCheckStatus: 'not_started' | 'pending' | 'cleared' | 'flagged' | 'provider_failed' | 'pre_adverse_action' | 'adverse_action_final';
   bgCheckDate?: Date | string | null;
+  /** Written FCRA authorization state (safe for UI; the evidence IP is never exposed). */
+  fcraAuthorized: boolean;
+  fcraDisclosureVersion: string | null;
   updatedAt?: Date | string | null;
 }
 
@@ -224,6 +227,26 @@ export const api = {
       path: '/api/washer-profile/financial-connections/session' as const,
       responses: {
         200: z.object({ clientSecret: z.string(), publishableKey: z.string() }),
+      }
+    },
+    fcraDisclosure: {
+      method: 'GET' as const,
+      path: '/api/washer/screening/fcra-disclosure' as const,
+      responses: {
+        200: z.object({ version: z.string(), text: z.string() }),
+      }
+    },
+    fcraAuthorize: {
+      method: 'POST' as const,
+      path: '/api/washer/screening/fcra-authorize' as const,
+      input: z.object({ authorized: z.literal(true) }),
+      responses: {
+        200: z.object({
+          authorized: z.boolean(),
+          version: z.string().nullable(),
+          authorizedAt: z.union([z.date(), z.string()]).nullable(),
+          bgCheckStatus: z.string(),
+        }),
       }
     },
     fcComplete: {

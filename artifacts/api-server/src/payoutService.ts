@@ -4,6 +4,7 @@ import { clerkClient } from "@clerk/express";
 import { logger } from "./lib/logger";
 import { pool } from "./db";
 import { retryWindowOpen } from "./incidentPolicy";
+import { WASHER_TOS_VERSION, getConnectAccountType } from "./lib/tos";
 
 export class PayoutError extends Error {
   constructor(message: string, public code: string) {
@@ -20,8 +21,15 @@ export const WASHER_PAYOUT_FAILURE_REASON =
 // can receive transfers without a full Express onboarding round-trip — that
 // is what we need to actually move money to the washer.
 //
+// The Connect account model is configurable via STRIPE_CONNECT_ACCOUNT_TYPE
+// ("custom" default, "express"); hosted/Express onboarding is not implemented
+// and fails fast rather than provisioning the wrong account type.
+//
 // Returns the Connect account id, creating it on first call.
-export async function ensureConnectAccount(userId: string): Promise<string> {
+export async function ensureConnectAccount(
+  userId: string,
+  opts?: { clientIp?: string },
+): Promise<string> {
   const lock = await pool.connect();
   try {
     // Account creation includes remote calls, so use a session advisory lock
@@ -32,6 +40,47 @@ export async function ensureConnectAccount(userId: string): Promise<string> {
     if (!profile) throw new PayoutError("Washer profile not found", "NO_PROFILE");
     if (!profile.stripeBankAccountId) throw new PayoutError("No verified bank on file", "NO_VERIFIED_BANK");
     const stripe = await getUncachableStripeClient();
+
+    if (getConnectAccountType() === "express") {
+      throw new PayoutError(
+        "Stripe-hosted Connect onboarding is not enabled for this deployment",
+        "CONNECT_MODEL_NOT_SUPPORTED",
+      );
+    }
+
+    // ToS acceptance evidence (timestamp + real client IP + terms version) is
+    // required before provisioning. It is recorded server-side when the
+    // washer agrees to the terms and never fabricated: rows without evidence
+    // fail closed unless a real client IP from the current request lets us
+    // record a fresh acceptance.
+    let tosDate = profile.tosAcceptedAt ?? null;
+    let tosIp = profile.tosAcceptedIp ?? null;
+    const evidenceComplete =
+      profile.agreedToTerms &&
+      tosDate instanceof Date &&
+      typeof tosIp === "string" &&
+      tosIp.length > 0 &&
+      profile.tosVersion === WASHER_TOS_VERSION;
+    if (!evidenceComplete) {
+      if (opts?.clientIp && profile.agreedToTerms) {
+        await storage.recordTosAcceptance(userId, { ip: opts.clientIp, version: WASHER_TOS_VERSION });
+        tosDate = new Date();
+        tosIp = opts.clientIp;
+      } else {
+        throw new PayoutError(
+          "Please re-accept the washer terms in your profile before payouts can be enabled.",
+          "TOS_EVIDENCE_MISSING",
+        );
+      }
+    }
+    if (!(tosDate instanceof Date) || !tosIp) {
+      // Unreachable: the evidence gate above either completed the evidence
+      // or threw. Kept as a fail-closed guard for type safety.
+      throw new PayoutError(
+        "Please re-accept the washer terms in your profile before payouts can be enabled.",
+        "TOS_EVIDENCE_MISSING",
+      );
+    }
     if (profile.stripeConnectAccountId) {
       // Accounts created before manual scheduling was enforced must also be
       // corrected before another transfer is sent.
@@ -70,46 +119,61 @@ export async function ensureConnectAccount(userId: string): Promise<string> {
       }
     }
 
-    // Stable idempotency keys recover the same Stripe objects if Stripe
-    // succeeds but the process exits before the local account id is persisted.
-    const account = await stripe.accounts.create({
-      type: "custom",
-      country: "US",
-      email,
-      capabilities: { transfers: { requested: true } },
-      settings: { payouts: { schedule: { interval: "manual" } } },
-      business_type: "individual",
-      individual: {
-        first_name: firstName,
-        last_name: lastName,
+    // Orphan recovery: if a previous attempt created the Stripe account but
+    // crashed before the local id was persisted, the create idempotency key
+    // has expired (Stripe keys live ~24h). Adopt the existing account via its
+    // washmateUserId metadata instead of creating a duplicate.
+    let connectAccountId: string;
+    const existingAccounts = await stripe.accounts.list({ limit: 100 });
+    const orphan = existingAccounts.data.find((a) => a.metadata?.["washmateUserId"] === userId);
+    if (orphan) {
+      logger.info({ userId, connectAccountId: orphan.id }, "Adopted orphaned Connect account");
+      connectAccountId = orphan.id;
+    } else {
+      // Stable idempotency keys recover the same Stripe objects if Stripe
+      // succeeds but the process exits before the local account id is
+      // persisted (within the ~24h key lifetime; older orphans are adopted
+      // via the metadata lookup above).
+      const account = await stripe.accounts.create({
+        type: "custom",
+        country: "US",
         email,
-        phone: profile.phone || undefined,
-        dob,
-        ssn_last_4: profile.taxId ? profile.taxId.replace(/\D/g, "").slice(-4) || undefined : undefined,
-        address: profile.state ? { country: "US", state: profile.state, city: profile.county || undefined } : undefined,
-      },
-      tos_acceptance: {
-        // Keep every create parameter stable across retries of the same
-        // idempotency key. Bank verification time is persisted before this.
-        date: Math.floor((profile.stripeVerifiedAt ?? profile.updatedAt ?? new Date(0)).getTime() / 1000),
-        ip: "127.0.0.1",
-        service_agreement: "recipient",
-      },
-      metadata: { washmateUserId: userId },
-    }, { idempotencyKey: `washmate_connect_account_${userId}` });
+        capabilities: { transfers: { requested: true } },
+        settings: { payouts: { schedule: { interval: "manual" } } },
+        business_type: "individual",
+        individual: {
+          first_name: firstName,
+          last_name: lastName,
+          email,
+          phone: profile.phone || undefined,
+          dob,
+          ssn_last_4: profile.taxId ? profile.taxId.replace(/\D/g, "").slice(-4) || undefined : undefined,
+          address: profile.state ? { country: "US", state: profile.state, city: profile.county || undefined } : undefined,
+        },
+        tos_acceptance: {
+          // Real acceptance evidence: the timestamp and client IP recorded
+          // when the washer agreed to the terms. Never fabricated.
+          date: Math.floor(tosDate.getTime() / 1000),
+          ip: tosIp,
+          service_agreement: "recipient",
+        },
+        metadata: { washmateUserId: userId },
+      }, { idempotencyKey: `washmate_connect_account_${userId}` });
+      connectAccountId = account.id;
+    }
 
     try {
-      await stripe.accounts.createExternalAccount(account.id, {
+      await stripe.accounts.createExternalAccount(connectAccountId, {
         external_account: profile.stripeBankAccountId,
         default_for_currency: true,
       }, { idempotencyKey: `washmate_connect_bank_${userId}_${profile.stripeBankAccountId}` });
     } catch (err: any) {
-      logger.error({ err, userId, connectAccountId: account.id }, "Failed to attach FC bank to Connect account");
+      logger.error({ err, userId, connectAccountId }, "Failed to attach FC bank to Connect account");
       throw new PayoutError(`Could not attach verified bank to payout account: ${err?.message ?? "unknown"}`, "ATTACH_BANK_FAILED");
     }
 
-    await storage.setStripeConnectAccountId(userId, account.id, profile.stripeBankAccountId);
-    return account.id;
+    await storage.setStripeConnectAccountId(userId, connectAccountId, profile.stripeBankAccountId);
+    return connectAccountId;
   } finally {
     await lock.query("SELECT pg_advisory_unlock(72942, hashtext($1))", [userId]).catch((err) => {
       logger.error({ err, userId }, "Failed to release Connect account creation lock");
@@ -127,18 +191,18 @@ export async function ensureConnectAccount(userId: string): Promise<string> {
 //      via ACH; the `payout.paid` / `payout.failed` webhook flips our row.
 // Any Stripe failure marks the local payout `failed` and releases its orders
 // so the washer can retry once the underlying issue is fixed.
-export async function executePayout(payoutId: number): Promise<void> {
+export async function executePayout(payoutId: number, opts?: { clientIp?: string }): Promise<void> {
   const lock = await pool.connect();
   try {
     await lock.query("SELECT pg_advisory_lock(72941, $1)", [payoutId]);
-    await executeLockedPayout(payoutId);
+    await executeLockedPayout(payoutId, opts);
   } finally {
     await lock.query("SELECT pg_advisory_unlock(72941, $1)", [payoutId]);
     lock.release();
   }
 }
 
-async function executeLockedPayout(payoutId: number): Promise<void> {
+async function executeLockedPayout(payoutId: number, opts?: { clientIp?: string }): Promise<void> {
   const payout = await storage.getPayout(payoutId);
   if (!payout) throw new PayoutError("Payout not found", "NOT_FOUND");
   if (payout.status !== "pending") return; // already settled — no-op
@@ -154,7 +218,7 @@ async function executeLockedPayout(payoutId: number): Promise<void> {
   const stripe = await getUncachableStripeClient();
   let connectAccountId: string;
   try {
-    connectAccountId = await ensureConnectAccount(payout.washerId);
+    connectAccountId = await ensureConnectAccount(payout.washerId, opts);
   } catch (err: any) {
     logger.error({ err, payoutId }, "Failed to prepare payout");
     await storage.markPayoutFailed(payoutId, WASHER_PAYOUT_FAILURE_REASON);

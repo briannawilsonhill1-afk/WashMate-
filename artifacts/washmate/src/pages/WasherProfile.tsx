@@ -6,6 +6,7 @@ import { loadStripe } from '@stripe/stripe-js';
 import { api, SENSITIVE_FIELD_MASK } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { Link } from 'wouter';
+import FcraDisclosureModal from '@/components/FcraDisclosureModal';
 import {
   ArrowLeft,
   CreditCard,
@@ -55,6 +56,7 @@ export default function WasherProfile() {
   const [state, setState] = useState('');
   const [bgCheckConsent, setBgCheckConsent] = useState(false);
   const [bgSelfCertify, setBgSelfCertify] = useState(false);
+  const [fcraModalOpen, setFcraModalOpen] = useState(false);
 
   useEffect(() => {
     if (profile) {
@@ -491,10 +493,12 @@ export default function WasherProfile() {
                   }`}>
                     {profile.bgCheckStatus === 'cleared' && <ShieldCheck className="w-3.5 h-3.5" />}
                     {(profile.bgCheckStatus === 'pending' || profile.bgCheckStatus === 'provider_failed') && <Clock className="w-3.5 h-3.5" />}
-                    {profile.bgCheckStatus === 'flagged' && <ShieldX className="w-3.5 h-3.5" />}
+                    {(profile.bgCheckStatus === 'flagged' || profile.bgCheckStatus === 'pre_adverse_action' || profile.bgCheckStatus === 'adverse_action_final') && <ShieldX className="w-3.5 h-3.5" />}
                     {profile.bgCheckStatus === 'cleared' ? 'Cleared' :
                      profile.bgCheckStatus === 'pending' ? 'Check In Progress' :
                      profile.bgCheckStatus === 'provider_failed' ? 'Provider Retry Needed' :
+                     profile.bgCheckStatus === 'pre_adverse_action' ? 'Under Review' :
+                     profile.bgCheckStatus === 'adverse_action_final' ? 'Not Eligible' :
                      'Flagged — Contact Support'}
                   </div>
                 )}
@@ -504,7 +508,7 @@ export default function WasherProfile() {
             <div className="bg-amber-50 dark:bg-amber-950/30 rounded-xl p-4 mb-5 text-sm text-amber-800 dark:text-amber-200">
               <div className="flex items-start gap-2">
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <p>WashMate uses an authorized screening provider and review process before a washer can claim jobs. You must provide your location and consent to submit screening information. A reviewer records the provider result, which may clear or flag your account.</p>
+                <p>WashMate uses Checkr, an authorized screening provider, and a review process before a washer can claim jobs. Provide your location below, then complete the separate background check disclosure and authorization step. A reviewer records the provider result, which may clear or flag your account.</p>
               </div>
             </div>
 
@@ -537,19 +541,36 @@ export default function WasherProfile() {
             </div>
 
             <div className="space-y-3">
-              <label className="flex items-start gap-3 cursor-pointer group" data-testid="label-bg-consent">
-                <input
-                  type="checkbox"
-                  checked={bgCheckConsent}
-                  onChange={(e) => setBgCheckConsent(e.target.checked)}
-                  disabled={profile?.bgCheckStatus === 'cleared'}
-                  className="mt-1 w-5 h-5 rounded border-border text-primary focus:ring-primary/30 cursor-pointer disabled:opacity-50"
-                  data-testid="checkbox-bg-consent"
-                />
-                <span className="text-sm text-foreground font-medium group-hover:text-primary transition-colors">
-                  I consent to WashMate sending my information to an authorized background-screening provider and reviewing the result for eligibility to claim jobs. I understand that a flagged result may prevent access and that I can contact support about next steps.
-                </span>
-              </label>
+              {/* Standalone FCRA disclosure & authorization. The disclosure is
+                  presented on its own screen inside the modal below — never
+                  bundled with other consents or terms. Authorization is a
+                  separate, explicit act recorded server-side with timestamp +
+                  IP + disclosure version. Screening cannot start without it. */}
+              <div className="rounded-xl border border-border/50 bg-secondary/30 p-4" data-testid="fcra-auth-card">
+                <div className="flex items-start gap-3">
+                  <FileText className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+                  <div className="flex-1">
+                    <p className="text-sm font-semibold text-foreground">Background check disclosure & authorization</p>
+                    {profile?.fcraAuthorized ? (
+                      <p className="text-sm text-emerald-600 mt-1 flex items-center gap-1.5">
+                        <ShieldCheck className="w-4 h-4" /> Authorized
+                        {profile.fcraDisclosureVersion ? ` (disclosure v${profile.fcraDisclosureVersion})` : ''} — you can review the disclosure again at any time.
+                      </p>
+                    ) : (
+                      <p className="text-sm text-muted-foreground mt-1">
+                        Before a background check can run, review the standalone disclosure and provide your written authorization.
+                      </p>
+                    )}
+                    <button
+                      onClick={() => setFcraModalOpen(true)}
+                      className="mt-3 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold transition-all"
+                      data-testid="button-fcra-open"
+                    >
+                      {profile?.fcraAuthorized ? 'Review disclosure' : 'Review disclosure and authorize'}
+                    </button>
+                  </div>
+                </div>
+              </div>
 
               <label className="flex items-start gap-3 cursor-pointer group" data-testid="label-bg-certify">
                 <input
@@ -591,6 +612,20 @@ export default function WasherProfile() {
               <div className="mt-4 flex items-start gap-2 text-sm text-red-600 bg-red-50 dark:bg-red-950/30 p-3 rounded-xl">
                 <ShieldX className="w-4 h-4 shrink-0" />
                 <span>Your screening result was flagged and your account cannot claim jobs. Contact WashMate support if you need to request next steps or a resubmission.</span>
+              </div>
+            )}
+
+            {profile?.bgCheckStatus === 'pre_adverse_action' && (
+              <div className="mt-4 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-200 bg-amber-50 dark:bg-amber-950/30 p-3 rounded-xl">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>Your screening is under review. If you received a notice about your background report, you have the right to review it and respond before any final decision. Contact WashMate support with questions.</span>
+              </div>
+            )}
+
+            {profile?.bgCheckStatus === 'adverse_action_final' && (
+              <div className="mt-4 flex items-start gap-2 text-sm text-red-600 bg-red-50 dark:bg-red-950/30 p-3 rounded-xl">
+                <ShieldX className="w-4 h-4 shrink-0" />
+                <span>Your washer application was not approved based on your background screening. Contact WashMate support if you have questions about this decision.</span>
               </div>
             )}
           </div>
@@ -664,6 +699,13 @@ export default function WasherProfile() {
           </button>
         </form>
       </motion.div>
+
+      <FcraDisclosureModal
+        open={fcraModalOpen}
+        onClose={() => setFcraModalOpen(false)}
+        onAuthorized={() => queryClient.invalidateQueries({ queryKey: ['/api/washer-profile'] })}
+        authorizedVersion={profile?.fcraDisclosureVersion ?? null}
+      />
     </div>
   );
 }

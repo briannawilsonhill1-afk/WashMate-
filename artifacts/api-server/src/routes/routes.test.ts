@@ -5,10 +5,14 @@ const mocks = vi.hoisted(() => ({
   storage: {
     getUser: vi.fn(),
     getWasherProfile: vi.fn(),
+    getWasherBgCheckStatus: vi.fn(),
     getWasherEarnings: vi.fn(),
     transitionWasherBgCheck: vi.fn(),
     resubmitWasherBgCheck: vi.fn(),
     getWasherBgCheckEvents: vi.fn(),
+    recordFcraAuthorization: vi.fn(),
+    transitionAdverseAction: vi.fn(),
+    getAdverseActionInfo: vi.fn(),
     getStripeCustomerId: vi.fn(),
     attachStripeBankAccount: vi.fn(),
     requestPayout: vi.fn(),
@@ -17,9 +21,19 @@ const mocks = vi.hoisted(() => ({
   getUncachableStripeClient: vi.fn(),
   getStripePublishableKey: vi.fn(),
   registerIncidentRoutes: vi.fn(),
+  startWasherScreening: vi.fn(),
+  getCheckrConfig: vi.fn(),
+  clerkClient: { users: { getUser: vi.fn() } },
 }));
 
 vi.mock("../storage", () => ({ storage: mocks.storage }));
+
+vi.mock("@clerk/express", () => ({ clerkClient: mocks.clerkClient }));
+
+vi.mock("../lib/checkr", () => ({
+  startWasherScreening: mocks.startWasherScreening,
+  getCheckrConfig: mocks.getCheckrConfig,
+}));
 
 vi.mock("../auth", () => ({
   isAuthenticated: vi.fn((_req: unknown, _res: unknown, next: () => void) => next()),
@@ -279,6 +293,281 @@ describe("washer screening decisions", () => {
       }),
     ]);
     expect(mocks.storage.getWasherBgCheckEvents).toHaveBeenCalledExactlyOnceWith("washer_target");
+  });
+});
+
+describe("FCRA screening routes", () => {
+  const bodyOf = (result: { body: unknown }) => result.body as Record<string, any>;
+
+  afterEach(() => {
+    delete process.env.WASHMATE_ADMIN_USER_IDS;
+    delete process.env.FCRA_BUSINESS_NAME;
+    delete process.env.FCRA_BUSINESS_ADDRESS;
+    delete process.env.FCRA_BUSINESS_PHONE;
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.WASHMATE_ADMIN_USER_IDS = "washer_1";
+    mocks.storage.getUser.mockResolvedValue({ id: "washer_1", role: "washer" });
+  });
+
+  it("serves the versioned standalone disclosure text", async () => {
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/fcra-disclosure")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(bodyOf(result).version).toBe("1.0");
+    expect(bodyOf(result).text).toContain("DISCLOSURE REGARDING BACKGROUND INVESTIGATION");
+    expect(bodyOf(result).text.toLowerCase()).not.toContain("terms of service");
+  });
+
+  it("records the washer's written authorization", async () => {
+    mocks.storage.getWasherProfile.mockResolvedValue({
+      userId: "washer_1",
+      bgCheckStatus: "not_started",
+      bgSelfCertify: true,
+      county: "Wyandotte",
+      state: "KS",
+    });
+    mocks.storage.recordFcraAuthorization.mockResolvedValue({
+      userId: "washer_1",
+      fcraDisclosureVersion: "1.0",
+      fcraAuthorizedAt: new Date("2026-10-16T00:00:00.000Z"),
+      bgCheckStatus: "pending",
+      state: "KS",
+    });
+    mocks.clerkClient.users.getUser.mockResolvedValue({ emailAddresses: [{ emailAddress: "w@example.com" }] });
+    mocks.getCheckrConfig.mockReturnValue({ apiKey: "x", packageSlug: "y", webhookSecrets: ["z"] });
+    mocks.startWasherScreening.mockResolvedValue({ candidateId: "cand_1", invitationId: "inv_1", invitationReused: false });
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/fcra-authorize")!,
+      { authorized: true },
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(bodyOf(result).authorized).toBe(true);
+    expect(bodyOf(result).bgCheckStatus).toBe("pending");
+    expect(mocks.storage.recordFcraAuthorization).toHaveBeenCalledExactlyOnceWith(
+      "washer_1",
+      { ip: null, version: "1.0" },
+    );
+    // Authorizing a complete profile submits the screening and starts Checkr.
+    expect(mocks.startWasherScreening).toHaveBeenCalledExactlyOnceWith(
+      { userId: "washer_1", email: "w@example.com", state: "KS" },
+    );
+  });
+
+  it("rejects authorization without explicit confirmation", async () => {
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/fcra-authorize")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(400);
+    expect(mocks.storage.recordFcraAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("rejects authorization for non-washers", async () => {    mocks.storage.getUser.mockResolvedValue({ id: "washer_1", role: "customer" });
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/fcra-authorize")!,
+      { authorized: true },
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(403);
+    expect(mocks.storage.recordFcraAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("requires a saved profile before authorization", async () => {
+    mocks.storage.getWasherProfile.mockResolvedValue(undefined);
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/fcra-authorize")!,
+      { authorized: true },
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(404);
+    expect(mocks.storage.recordFcraAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("maps FCRA_AUTHORIZATION_MISSING to a clear 409 on resend-invitation", async () => {
+    mocks.storage.getWasherProfile.mockResolvedValue({ state: "KS", bgCheckStatus: "pending" });
+    mocks.clerkClient.users.getUser.mockResolvedValue({ emailAddresses: [{ emailAddress: "w@example.com" }] });
+    mocks.getCheckrConfig.mockReturnValue({ apiKey: "x", packageSlug: "y", webhookSecrets: ["z"] });
+    mocks.startWasherScreening.mockRejectedValue(new Error("FCRA_AUTHORIZATION_MISSING"));
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer/screening/resend-invitation")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(409);
+    expect(bodyOf(result).code).toBe("FCRA_AUTHORIZATION_MISSING");
+  });
+
+  it("blocks non-admins from the adverse-action endpoints", async () => {
+    process.env.WASHMATE_ADMIN_USER_IDS = "another_operator";
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    for (const path of [
+      "/api/admin/washer-screening/:userId/pre-adverse",
+      "/api/admin/washer-screening/:userId/adverse-final",
+      "/api/admin/washer-screening/:userId/clear-dispute",
+    ]) {
+      const result = await invokeRoute(
+        registered.get(path)!,
+        {},
+        { error: vi.fn(), warn: vi.fn() },
+        { userId: "washer_target" },
+      );
+      expect(result.statusCode).toBe(403);
+    }
+    expect(mocks.storage.transitionAdverseAction).not.toHaveBeenCalled();
+  });
+
+  it("refuses to generate a pre-adverse notice while business details are unconfigured", async () => {
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/admin/washer-screening/:userId/pre-adverse")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+      { userId: "washer_target" },
+    );
+
+    expect(result.statusCode).toBe(409);
+    expect(mocks.storage.transitionAdverseAction).not.toHaveBeenCalled();
+  });
+
+  it("generates the pre-adverse notice for an admin with configured details", async () => {
+    process.env.FCRA_BUSINESS_NAME = "WashMate LLC";
+    process.env.FCRA_BUSINESS_ADDRESS = "123 Main St, Kansas City, MO";
+    process.env.FCRA_BUSINESS_PHONE = "555-1234";
+    mocks.storage.transitionAdverseAction.mockResolvedValue({
+      userId: "washer_target",
+      bgCheckStatus: "pre_adverse_action",
+      legalName: "Test Washer",
+      preAdverseSentAt: new Date("2026-10-16T00:00:00.000Z"),
+    });
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/admin/washer-screening/:userId/pre-adverse")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+      { userId: "washer_target" },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(bodyOf(result).bgCheckStatus).toBe("pre_adverse_action");
+    expect(bodyOf(result).notice).toContain("TEMPLATE");
+    expect(bodyOf(result).notice).toContain("WashMate LLC");
+    expect(bodyOf(result).deliveryNote).toBeDefined();
+    expect(mocks.storage.transitionAdverseAction).toHaveBeenCalledWith(
+      "washer_target",
+      expect.objectContaining({ toStatus: "pre_adverse_action", actorId: "washer_1" }),
+    );
+  });
+
+  it("maps an unelapsed waiting period to 409 on adverse-final", async () => {
+    process.env.FCRA_BUSINESS_NAME = "WashMate LLC";
+    process.env.FCRA_BUSINESS_ADDRESS = "123 Main St, Kansas City, MO";
+    process.env.FCRA_BUSINESS_PHONE = "555-1234";
+    const err = new Error("ADVERSE_ACTION_WAIT_NOT_ELAPSED") as Error & { remainingBusinessDays?: number };
+    err.remainingBusinessDays = 3;
+    mocks.storage.transitionAdverseAction.mockRejectedValue(err);
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/admin/washer-screening/:userId/adverse-final")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+      { userId: "washer_target" },
+    );
+
+    expect(result.statusCode).toBe(409);
+    expect(bodyOf(result).remainingBusinessDays).toBe(3);
+  });
+
+  it("lets an admin clear a flagged washer on dispute resolution", async () => {
+    mocks.storage.transitionAdverseAction.mockResolvedValue({
+      userId: "washer_target",
+      bgCheckStatus: "cleared",
+    });
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/admin/washer-screening/:userId/clear-dispute")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+      { userId: "washer_target" },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(bodyOf(result).bgCheckStatus).toBe("cleared");
+    expect(mocks.storage.transitionAdverseAction).toHaveBeenCalledWith(
+      "washer_target",
+      expect.objectContaining({ toStatus: "cleared", reasonCode: "dispute_resolved" }),
+    );
+  });
+
+  it("extends the washer status view with authorization and adverse-action state", async () => {
+    mocks.storage.getWasherBgCheckStatus.mockResolvedValue({ bgCheckStatus: "pre_adverse_action" });
+    mocks.storage.getWasherProfile.mockResolvedValue({
+      userId: "washer_1",
+      fcraDisclosureVersion: "1.0",
+      fcraAuthorizedAt: new Date(),
+    });
+    mocks.storage.getAdverseActionInfo.mockResolvedValue({
+      bgCheckStatus: "pre_adverse_action",
+      preAdverseSentAt: new Date("2026-10-16T00:00:00.000Z"),
+      waitDays: 5,
+      readiness: { allowed: false, businessDaysElapsed: 0, waitDays: 5, remainingBusinessDays: 5 },
+    });
+    const { app, registered } = createRouteApp();
+    await registerRoutes({} as any, app);
+
+    const result = await invokeRoute(
+      registered.get("/api/washer-profile/status")!,
+      {},
+      { error: vi.fn(), warn: vi.fn() },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(bodyOf(result).bgCheckStatus).toBe("pre_adverse_action");
+    expect(bodyOf(result).fcraAuthorized).toBe(true);
+    expect(bodyOf(result).fcraDisclosureCurrent).toBe("1.0");
+    expect(bodyOf(result).adverseAction.status).toBe("pre_adverse_action");
+    expect(bodyOf(result).adverseAction.remainingBusinessDays).toBe(5);
   });
 });
 
